@@ -17,5 +17,6 @@ defined('TYPO3') or die();
         authorizationUrl: 'https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize',
         tokenUrl: 'https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token',
         defaultScopes: ['https://graph.microsoft.com/.default'],
+        setupGuideUrl: 'https://github.com/WapplerSystems/t3-microsoft-graph-mailer/blob/main/Documentation/AzureAppRegistration.md',
     ));
 })();

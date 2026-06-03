@@ -4,14 +4,13 @@ declare(strict_types=1);
 
 namespace WapplerSystems\MicrosoftGraphMailer\Mailer;
 
-use Psr\EventDispatcher\EventDispatcherInterface;
-use Psr\Log\LoggerInterface;
-use Psr\Log\NullLogger;
 use Symfony\Component\Mailer\SentMessage;
 use Symfony\Component\Mailer\Transport\AbstractTransport;
 use Symfony\Component\Mime\Email;
 use Symfony\Component\Mime\Message;
 use TYPO3\CMS\Core\Http\RequestFactory;
+use TYPO3\CMS\Core\Log\LogManager;
+use TYPO3\CMS\Core\Utility\GeneralUtility;
 use WapplerSystems\MicrosoftGraphMailer\Exception\GraphMailerException;
 use WapplerSystems\OauthService\Service\OAuthClientService;
 use WapplerSystems\OauthService\Service\TokenAcquisitionService;
@@ -24,21 +23,30 @@ use WapplerSystems\OauthService\Service\TokenAcquisitionService;
  * Wiring: set $TYPO3_CONF_VARS['MAIL']['transport'] to this class FQCN.
  * Sender mailbox + tenant id are read from the active OAuth client's metadata
  * JSON (keys: tenant_id, sender_upn).
+ *
+ * Note on dependencies: TYPO3 TransportFactory loads custom transports via
+ * GeneralUtility::makeInstance(FQCN, $mailSettings). makeInstance only
+ * consults the DI container when no constructor arguments are passed
+ * (see GeneralUtility.php), so we cannot use constructor autowiring here.
+ * Services are looked up lazily inside doSend() via makeInstance, which
+ * works because TokenAcquisitionService, OAuthClientService and
+ * RequestFactory are all exposed as public container services.
  */
 final class GraphTransport extends AbstractTransport
 {
     private const PROVIDER = 'microsoft_graph';
     private const SEND_MAIL_ENDPOINT = 'https://graph.microsoft.com/v1.0/users/%s/sendMail';
 
-    public function __construct(
-        private readonly TokenAcquisitionService $tokenAcquisition,
-        private readonly OAuthClientService $oauthClient,
-        private readonly RequestFactory $requestFactory,
-        private readonly EmailToGraphPayloadMapper $mapper,
-        ?EventDispatcherInterface $dispatcher = null,
-        ?LoggerInterface $logger = null,
-    ) {
-        parent::__construct($dispatcher, $logger ?? new NullLogger());
+    /**
+     * @param array<string, mixed> $mailSettings Reserved for future per-deployment
+     *     overrides (e.g. a different provider identifier). Not used yet.
+     */
+    public function __construct(array $mailSettings = [])
+    {
+        parent::__construct(
+            null,
+            GeneralUtility::makeInstance(LogManager::class)->getLogger(self::class)
+        );
     }
 
     public function __toString(): string
@@ -56,7 +64,12 @@ final class GraphTransport extends AbstractTransport
             ));
         }
 
-        $senderUpn = (string)$this->oauthClient->getActiveClientMetadataValueByProvider(
+        $oauthClient = GeneralUtility::makeInstance(OAuthClientService::class);
+        $tokenAcquisition = GeneralUtility::makeInstance(TokenAcquisitionService::class);
+        $requestFactory = GeneralUtility::makeInstance(RequestFactory::class);
+        $mapper = GeneralUtility::makeInstance(EmailToGraphPayloadMapper::class);
+
+        $senderUpn = (string)$oauthClient->getActiveClientMetadataValueByProvider(
             self::PROVIDER,
             'sender_upn',
             ''
@@ -68,7 +81,7 @@ final class GraphTransport extends AbstractTransport
             );
         }
 
-        $token = $this->tokenAcquisition->getClientCredentialsToken(self::PROVIDER);
+        $token = $tokenAcquisition->getClientCredentialsToken(self::PROVIDER);
         if ($token === null || $token === '') {
             throw new GraphMailerException(
                 'TokenAcquisitionService returned no access token for provider microsoft_graph. '
@@ -76,10 +89,10 @@ final class GraphTransport extends AbstractTransport
             );
         }
 
-        $payload = $this->mapper->map($original);
+        $payload = $mapper->map($original);
         $url = sprintf(self::SEND_MAIL_ENDPOINT, rawurlencode($senderUpn));
 
-        $response = $this->requestFactory->request($url, 'POST', [
+        $response = $requestFactory->request($url, 'POST', [
             'headers' => [
                 'Authorization' => 'Bearer ' . $token,
                 'Content-Type' => 'application/json',

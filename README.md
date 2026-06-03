@@ -12,8 +12,7 @@ No SMTP. No mailbox password. No interactive user consent needed.
 Office 365 / Exchange Online is phasing out Basic Authentication for SMTP
 AUTH. Modern delivery uses the Microsoft Graph `sendMail` endpoint with
 an OAuth2 bearer token. This extension wires that endpoint into TYPO3's
-existing Symfony Mailer pipeline so any `MailerInterface` consumer
-(form_extended, fe_registration, EXT:news, scheduler reports, …) sends
+existing Symfony Mailer pipeline so any `MailerInterface` consumer sends
 through Graph transparently.
 
 ## Requirements

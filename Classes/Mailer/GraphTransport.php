@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace WapplerSystems\MicrosoftGraphMailer\Mailer;
 
+use Psr\Log\LoggerInterface;
 use Symfony\Component\Mailer\SentMessage;
 use Symfony\Component\Mailer\Transport\AbstractTransport;
 use Symfony\Component\Mime\Email;
@@ -42,6 +43,7 @@ final class GraphTransport extends AbstractTransport
     private const SEND_MAIL_ENDPOINT = 'https://graph.microsoft.com/v1.0/users/%s/sendMail';
 
     private readonly mixed $fallbackDirectorySetting;
+    private readonly LoggerInterface $log;
 
     /**
      * @param array<string, mixed> $mailSettings TYPO3 mail settings array passed by
@@ -49,10 +51,8 @@ final class GraphTransport extends AbstractTransport
      */
     public function __construct(array $mailSettings = [])
     {
-        parent::__construct(
-            null,
-            GeneralUtility::makeInstance(LogManager::class)->getLogger(self::class)
-        );
+        $this->log = GeneralUtility::makeInstance(LogManager::class)->getLogger(self::class);
+        parent::__construct(null, $this->log);
 
         // Read at construct time so we capture the value once. TYPO3 caches the
         // transport instance for the request, so re-reading on every send would
@@ -86,7 +86,7 @@ final class GraphTransport extends AbstractTransport
             }
 
             $emlPath = $this->writeFallbackFile($original, $e, $fallbackDir);
-            $this->logger->warning(
+            $this->log->warning(
                 'Microsoft Graph delivery failed; original message spooled to file for recovery',
                 [
                     'reason' => $e->getMessage(),
@@ -194,7 +194,7 @@ final class GraphTransport extends AbstractTransport
 
         if (!is_dir($configured)) {
             if (!@mkdir($configured, 0775, true) && !is_dir($configured)) {
-                $this->logger->error(
+                $this->log->error(
                     'Microsoft Graph fallback directory cannot be created; original exception will be re-thrown',
                     ['path' => $configured]
                 );

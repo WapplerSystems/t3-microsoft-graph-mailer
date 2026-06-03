@@ -29,6 +29,15 @@ final class MicrosoftGraphProviderType implements OAuthProviderTypeInterface
         return true;
     }
 
+    public function prefersClientCredentials(): bool
+    {
+        // Our setup is Mail.Send as Application permission (app-only). The
+        // authorization-code path would require Delegated permissions and a
+        // redirect URI, which is intentionally not configured. Tell the BE
+        // module to hide the Connect button for this provider.
+        return true;
+    }
+
     public function fetchClientCredentialsToken(
         ProviderDefinition $providerDefinition,
         Client $client,

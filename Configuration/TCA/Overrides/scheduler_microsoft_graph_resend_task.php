@@ -51,6 +51,7 @@ defined('TYPO3') or die();
             disable,
             description,
     ',
+    [],
     '',
     'tx_scheduler_task'
 );

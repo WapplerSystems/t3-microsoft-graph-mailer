@@ -107,8 +107,14 @@ final class GraphTransport extends AbstractTransport
                     . 'is blocking this mailbox. Run Get-ApplicationAccessPolicy in Exchange Online PowerShell and '
                     . 'add the sender mailbox to the allowed group.';
             } elseif ($status === 404 && str_contains($body, 'MailboxNotEnabledForRESTAPI')) {
-                $hint = ' — 404 MailboxNotEnabledForRESTAPI means the sender UPN has no Exchange Online license or '
-                    . 'is not a real mailbox. Verify the mailbox in Microsoft 365 admin center.';
+                $hint = ' — 404 MailboxNotEnabledForRESTAPI means the sender UPN exists but has no Exchange Online '
+                    . 'license. Assign an Exchange Online Plan 1 (or M365 Business Basic) license to this mailbox in '
+                    . 'the Microsoft 365 admin center.';
+            } elseif ($status === 404 && str_contains($body, 'ErrorInvalidUser')) {
+                $hint = ' — 404 ErrorInvalidUser means the sender UPN does not exist in the tenant at all. '
+                    . 'Verify the exact UPN in the Microsoft 365 admin center (Active users). Note that an SMTP '
+                    . 'address can differ from the account UPN — the sender_upn metadata must match the login UPN, '
+                    . 'not necessarily the primary SMTP address.';
             }
 
             throw new GraphMailerException(sprintf(

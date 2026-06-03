@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xliff version="1.2" xmlns="urn:oasis:names:tc:xliff:document:1.2">
+    <file source-language="en" datatype="plaintext" original="EXT:microsoft_graph_mailer/Resources/Private/Language/locallang_be.xlf"
+          product-name="microsoft_graph_mailer">
+        <header/>
+        <body>
+            <trans-unit id="task.resend.title">
+                <source>Microsoft Graph: resend undelivered emails</source>
+            </trans-unit>
+            <trans-unit id="task.resend.description">
+                <source>Retries emails that were spooled to the var/typo3-mail-spool/ directory because Microsoft Graph rejected them. Successful deliveries delete the .eml/.json pair; failures stay in the spool with their retry_count incremented. Recommended cadence: every 5 minutes.</source>
+            </trans-unit>
+            <trans-unit id="task.resend.batch_size">
+                <source>Batch size</source>
+            </trans-unit>
+            <trans-unit id="task.resend.batch_size.description">
+                <source>Maximum number of spooled emails the task will attempt per run. Default 50.</source>
+            </trans-unit>
+            <trans-unit id="task.resend.max_age_days">
+                <source>Max age (days)</source>
+            </trans-unit>
+            <trans-unit id="task.resend.max_age_days.description">
+                <source>Spooled emails older than this many days are deleted (abandoned) instead of being retried. Set to 0 to keep entries forever.</source>
+            </trans-unit>
+        </body>
+    </file>
+</xliff>

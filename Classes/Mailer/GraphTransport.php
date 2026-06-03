@@ -27,20 +27,21 @@ use WapplerSystems\OauthService\Service\TokenAcquisitionService;
  * JSON (keys: tenant_id, sender_upn).
  *
  * Failure handling: when Graph rejects the request (missing client, missing
- * token, HTTP 4xx/5xx) the original Email is serialised to an .eml file in
- * the fallback spool directory so the operator can recover and re-send it
- * later. The default spool location is var/log/microsoft-graph-mailer/
- * undelivered/. Override via $TYPO3_CONF_VARS['MAIL']['transport_graph_
- * fallback_directory']; set to false to disable the fallback (in which case
- * any failure re-raises GraphMailerException and propagates up).
+ * token, HTTP 4xx/5xx) the message is serialised to an .eml + .json pair in
+ * the spool directory so a recovery / retry can pick it up later. Default
+ * location: <typo3_var>/typo3-mail-spool/. Override via $TYPO3_CONF_VARS
+ * ['MAIL']['transport_graph_fallback_directory']; set to false to disable
+ * the fallback and re-raise GraphMailerException.
  *
- * Use the typo3 microsoft-graph-mailer:list-undelivered command to audit the
- * spool directory.
+ * Use microsoft-graph-mailer:list-undelivered to audit the spool and
+ * microsoft-graph-mailer:resend-undelivered (manually or via Scheduler task)
+ * to retry the saved Graph payloads.
  */
 final class GraphTransport extends AbstractTransport
 {
-    private const PROVIDER = 'microsoft_graph';
-    private const SEND_MAIL_ENDPOINT = 'https://graph.microsoft.com/v1.0/users/%s/sendMail';
+    public const PROVIDER = 'microsoft_graph';
+    public const SEND_MAIL_ENDPOINT_TEMPLATE = 'https://graph.microsoft.com/v1.0/users/%s/sendMail';
+    public const DEFAULT_SPOOL_RELATIVE_PATH = '/typo3-mail-spool';
 
     private readonly mixed $fallbackDirectorySetting;
     private readonly LoggerInterface $log;
@@ -54,9 +55,6 @@ final class GraphTransport extends AbstractTransport
         $this->log = GeneralUtility::makeInstance(LogManager::class)->getLogger(self::class);
         parent::__construct(null, $this->log);
 
-        // Read at construct time so we capture the value once. TYPO3 caches the
-        // transport instance for the request, so re-reading on every send would
-        // be wasted work.
         $this->fallbackDirectorySetting = $mailSettings['transport_graph_fallback_directory']
             ?? $GLOBALS['TYPO3_CONF_VARS']['MAIL']['transport_graph_fallback_directory']
             ?? null;
@@ -65,6 +63,40 @@ final class GraphTransport extends AbstractTransport
     public function __toString(): string
     {
         return 'ms-graph://' . self::PROVIDER;
+    }
+
+    /**
+     * Returns the default spool directory location used when nothing is
+     * configured. Public so the Resend command and List command share the
+     * exact same path resolution.
+     */
+    public static function defaultSpoolDirectory(): string
+    {
+        return Environment::getVarPath() . self::DEFAULT_SPOOL_RELATIVE_PATH;
+    }
+
+    /**
+     * Resolves the configured spool directory (or default) into an absolute
+     * path, creating it on demand. Returns null when the operator has set the
+     * config to false to disable the fallback entirely.
+     */
+    public static function resolveSpoolDirectory(?LoggerInterface $logger = null): ?string
+    {
+        $setting = $GLOBALS['TYPO3_CONF_VARS']['MAIL']['transport_graph_fallback_directory'] ?? null;
+        if ($setting === false) {
+            return null;
+        }
+
+        $path = is_string($setting) && $setting !== ''
+            ? $setting
+            : self::defaultSpoolDirectory();
+
+        if (!is_dir($path) && !@mkdir($path, 0775, true) && !is_dir($path)) {
+            $logger?->error('Microsoft Graph spool directory cannot be created', ['path' => $path]);
+            return null;
+        }
+
+        return rtrim($path, '/');
     }
 
     protected function doSend(SentMessage $message): void
@@ -77,15 +109,18 @@ final class GraphTransport extends AbstractTransport
             ));
         }
 
+        $mapper = GeneralUtility::makeInstance(EmailToGraphPayloadMapper::class);
+        $graphPayload = $mapper->map($original);
+
         try {
-            $this->trySendViaGraph($original);
+            $this->trySendViaGraph($graphPayload);
         } catch (GraphMailerException $e) {
-            $fallbackDir = $this->resolveFallbackDirectory();
+            $fallbackDir = $this->resolveFallbackDirectoryWithInstanceSetting();
             if ($fallbackDir === null) {
                 throw $e;
             }
 
-            $emlPath = $this->writeFallbackFile($original, $e, $fallbackDir);
+            $emlPath = $this->writeFallbackFile($original, $e, $fallbackDir, $graphPayload);
             $this->log->warning(
                 'Microsoft Graph delivery failed; original message spooled to file for recovery',
                 [
@@ -98,12 +133,14 @@ final class GraphTransport extends AbstractTransport
         }
     }
 
-    private function trySendViaGraph(Email $original): void
+    /**
+     * @param array<string, mixed> $graphPayload
+     */
+    private function trySendViaGraph(array $graphPayload): void
     {
         $oauthClient = GeneralUtility::makeInstance(OAuthClientService::class);
         $tokenAcquisition = GeneralUtility::makeInstance(TokenAcquisitionService::class);
         $requestFactory = GeneralUtility::makeInstance(RequestFactory::class);
-        $mapper = GeneralUtility::makeInstance(EmailToGraphPayloadMapper::class);
 
         $senderUpn = (string)$oauthClient->getActiveClientMetadataValueByProvider(
             self::PROVIDER,
@@ -125,8 +162,24 @@ final class GraphTransport extends AbstractTransport
             );
         }
 
-        $payload = $mapper->map($original);
-        $url = sprintf(self::SEND_MAIL_ENDPOINT, rawurlencode($senderUpn));
+        self::postSendMail($requestFactory, $senderUpn, $token, $graphPayload);
+    }
+
+    /**
+     * Static so the Resend command can reuse it without re-instantiating the
+     * full transport. Throws GraphMailerException on any non-202 response with
+     * a hint string mapping the most common AADSTS / Graph error shapes to
+     * remediation steps.
+     *
+     * @param array<string, mixed> $graphPayload
+     */
+    public static function postSendMail(
+        RequestFactory $requestFactory,
+        string $senderUpn,
+        string $token,
+        array $graphPayload
+    ): void {
+        $url = sprintf(self::SEND_MAIL_ENDPOINT_TEMPLATE, rawurlencode($senderUpn));
 
         $response = $requestFactory->request($url, 'POST', [
             'headers' => [
@@ -134,79 +187,68 @@ final class GraphTransport extends AbstractTransport
                 'Content-Type' => 'application/json',
                 'Accept' => 'application/json',
             ],
-            'json' => $payload,
+            'json' => $graphPayload,
             'timeout' => 30,
             'http_errors' => false,
         ]);
 
         $status = $response->getStatusCode();
-        if ($status !== 202) {
-            $requestId = $response->getHeaderLine('request-id');
-            $body = (string)$response->getBody();
-
-            $hint = '';
-            if ($status === 401 && $body === '') {
-                $hint = ' — empty 401 body almost always means the access token carries no application roles. '
-                    . 'In Azure: App registrations → your app → API permissions → confirm "Mail.Send" is listed under '
-                    . 'Application permissions (NOT Delegated) and shows "Granted for <tenant>". '
-                    . 'Click "Grant admin consent" if the status is orange. Then invalidate the token cache '
-                    . '(e.g. typo3 cache:flush) before retrying.';
-            } elseif ($status === 403 && str_contains($body, 'Access is denied')) {
-                $hint = ' — 403 ErrorAccessDenied typically means an Application Access Policy in Exchange Online '
-                    . 'is blocking this mailbox. Run Get-ApplicationAccessPolicy in Exchange Online PowerShell and '
-                    . 'add the sender mailbox to the allowed group.';
-            } elseif ($status === 404 && str_contains($body, 'MailboxNotEnabledForRESTAPI')) {
-                $hint = ' — 404 MailboxNotEnabledForRESTAPI means the sender UPN exists but has no Exchange Online '
-                    . 'license. Assign an Exchange Online Plan 1 (or M365 Business Basic) license to this mailbox in '
-                    . 'the Microsoft 365 admin center.';
-            } elseif ($status === 404 && str_contains($body, 'ErrorInvalidUser')) {
-                $hint = ' — 404 ErrorInvalidUser means the sender UPN does not exist in the tenant at all. '
-                    . 'Verify the exact UPN in the Microsoft 365 admin center (Active users). Note that an SMTP '
-                    . 'address can differ from the account UPN — the sender_upn metadata must match the login UPN, '
-                    . 'not necessarily the primary SMTP address.';
-            }
-
-            throw new GraphMailerException(sprintf(
-                'Microsoft Graph sendMail failed (HTTP %d, request-id=%s, sender=%s): %s%s',
-                $status,
-                $requestId !== '' ? $requestId : 'n/a',
-                $senderUpn,
-                $body !== '' ? $body : '<empty body>',
-                $hint
-            ));
+        if ($status === 202) {
+            return;
         }
+
+        $requestId = $response->getHeaderLine('request-id');
+        $body = (string)$response->getBody();
+
+        $hint = '';
+        if ($status === 401 && $body === '') {
+            $hint = ' — empty 401 body almost always means the access token carries no application roles. '
+                . 'In Azure: App registrations → your app → API permissions → confirm "Mail.Send" is listed under '
+                . 'Application permissions (NOT Delegated) and shows "Granted for <tenant>". '
+                . 'Click "Grant admin consent" if the status is orange. Then invalidate the token cache '
+                . '(e.g. typo3 cache:flush) before retrying.';
+        } elseif ($status === 403 && str_contains($body, 'Access is denied')) {
+            $hint = ' — 403 ErrorAccessDenied typically means an Application Access Policy in Exchange Online '
+                . 'is blocking this mailbox. Run Get-ApplicationAccessPolicy in Exchange Online PowerShell and '
+                . 'add the sender mailbox to the allowed group.';
+        } elseif ($status === 404 && str_contains($body, 'MailboxNotEnabledForRESTAPI')) {
+            $hint = ' — 404 MailboxNotEnabledForRESTAPI means the sender UPN exists but has no Exchange Online '
+                . 'license. Assign an Exchange Online Plan 1 (or M365 Business Basic) license to this mailbox in '
+                . 'the Microsoft 365 admin center.';
+        } elseif ($status === 404 && str_contains($body, 'ErrorInvalidUser')) {
+            $hint = ' — 404 ErrorInvalidUser means the sender UPN does not exist in the tenant at all. '
+                . 'Verify the exact UPN in the Microsoft 365 admin center (Active users). Note that an SMTP '
+                . 'address can differ from the account UPN — the sender_upn metadata must match the login UPN, '
+                . 'not necessarily the primary SMTP address.';
+        }
+
+        throw new GraphMailerException(sprintf(
+            'Microsoft Graph sendMail failed (HTTP %d, request-id=%s, sender=%s): %s%s',
+            $status,
+            $requestId !== '' ? $requestId : 'n/a',
+            $senderUpn,
+            $body !== '' ? $body : '<empty body>',
+            $hint
+        ));
     }
 
-    /**
-     * Returns the absolute fallback directory, ensuring it exists, or null when
-     * the operator has explicitly disabled the fallback by setting the config
-     * value to false.
-     */
-    private function resolveFallbackDirectory(): ?string
+    private function resolveFallbackDirectoryWithInstanceSetting(): ?string
     {
         if ($this->fallbackDirectorySetting === false) {
             return null;
         }
-
-        $configured = is_string($this->fallbackDirectorySetting) && $this->fallbackDirectorySetting !== ''
-            ? $this->fallbackDirectorySetting
-            : Environment::getVarPath() . '/log/microsoft-graph-mailer/undelivered';
-
-        if (!is_dir($configured)) {
-            if (!@mkdir($configured, 0775, true) && !is_dir($configured)) {
-                $this->log->error(
-                    'Microsoft Graph fallback directory cannot be created; original exception will be re-thrown',
-                    ['path' => $configured]
-                );
-                return null;
-            }
-        }
-
-        return rtrim($configured, '/');
+        return self::resolveSpoolDirectory($this->log);
     }
 
-    private function writeFallbackFile(Email $email, GraphMailerException $reason, string $directory): string
-    {
+    /**
+     * @param array<string, mixed> $graphPayload
+     */
+    private function writeFallbackFile(
+        Email $email,
+        GraphMailerException $reason,
+        string $directory,
+        array $graphPayload
+    ): string {
         $emlBody = $email->toString();
         $recipientHint = '';
         $firstTo = $email->getTo()[0] ?? null;
@@ -233,6 +275,8 @@ final class GraphTransport extends AbstractTransport
             'to' => array_map(static fn ($a) => $a->toString(), $email->getTo()),
             'cc' => array_map(static fn ($a) => $a->toString(), $email->getCc()),
             'bcc' => array_map(static fn ($a) => $a->toString(), $email->getBcc()),
+            'retry_count' => 0,
+            'graph_payload' => $graphPayload,
         ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
 
         return $emlPath;

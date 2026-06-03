@@ -122,30 +122,49 @@ that in any Microsoft support case.
 To avoid silently dropping emails when Microsoft Graph rejects a request
 (no OAuth client configured, expired secret, license issue, 401/403/404
 from `sendMail`, …), the transport writes the original message as an
-`.eml` file plus a `.json` failure record to a spool directory and lets
+`.eml` file plus a `.json` payload record to a spool directory and lets
 the caller proceed. Default location:
 
 ```
-<typo3_var>/log/microsoft-graph-mailer/undelivered/
+<typo3_var>/typo3-mail-spool/
 ```
 
 Each undelivered message becomes a pair:
 
 - `YYYYMMDD-HHMMSS-recipient_at_domain-xxxxxxxx.eml` — full RFC 5322
-  message; openable in any mail client, ready for manual resend
-- `YYYYMMDD-HHMMSS-recipient_at_domain-xxxxxxxx.json` — failure metadata
-  (timestamp, error reason, recipients, subject)
+  message; openable in any mail client, useful for human inspection or
+  manual resend
+- `YYYYMMDD-HHMMSS-recipient_at_domain-xxxxxxxx.json` — failure
+  metadata (timestamp, reason, recipients, subject) plus the original
+  Microsoft Graph `sendMail` payload (`graph_payload`) so an automated
+  retry does not need to re-parse the .eml
 
-### Audit and recovery
+### Audit
 
 ```bash
 typo3 microsoft-graph-mailer:list-undelivered
 ```
 
-shows everything currently in the spool with the original failure reason.
-Inspect the `.eml` file with any RFC 5322-aware tool, manually fix the
-issue (e.g. add the missing Mailbox license in Microsoft 365), and once
-recovered delete the `.eml` / `.json` pair.
+shows everything currently in the spool with the original failure
+reason and retry count.
+
+### Automatic retry (recommended)
+
+`typo3 microsoft-graph-mailer:resend-undelivered` iterates the spool
+and re-posts each entry's `graph_payload` to Microsoft Graph. On
+success the pair is deleted; on failure the entry stays in the spool
+with `retry_count` incremented and `last_retry_error` recorded.
+
+Options:
+- `--limit N` — process at most N entries per run (default 50)
+- `--max-age-days D` — delete (abandon) entries older than D days; 0 disables
+- `--dry-run` — list what would be retried without contacting Graph
+- `--dir PATH` — override the spool directory
+
+Schedule this command in the TYPO3 Scheduler module as
+**"Microsoft Graph: resend undelivered emails"** (registered task) every
+five minutes. The task exposes a *Batch size* and *Max age (days)* field
+in the BE form.
 
 ### Configuration
 

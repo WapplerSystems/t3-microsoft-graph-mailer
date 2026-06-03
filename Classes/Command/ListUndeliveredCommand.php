@@ -10,7 +10,7 @@ use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Style\SymfonyStyle;
-use TYPO3\CMS\Core\Core\Environment;
+use WapplerSystems\MicrosoftGraphMailer\Mailer\GraphTransport;
 
 #[AsCommand(
     name: 'microsoft-graph-mailer:list-undelivered',
@@ -71,15 +71,12 @@ final class ListUndeliveredCommand extends Command
     private function resolveDirectory(InputInterface $input): ?string
     {
         $configured = $input->getOption('dir');
-        if (!is_string($configured) || $configured === '') {
-            $configured = $GLOBALS['TYPO3_CONF_VARS']['MAIL']['transport_graph_fallback_directory']
-                ?? null;
-        }
-        if (!is_string($configured) || $configured === '') {
-            $configured = Environment::getVarPath() . '/log/microsoft-graph-mailer/undelivered';
+        if (is_string($configured) && $configured !== '') {
+            return is_dir($configured) ? rtrim($configured, '/') : null;
         }
 
-        return is_dir($configured) ? rtrim($configured, '/') : null;
+        $directory = GraphTransport::resolveSpoolDirectory();
+        return $directory !== null && is_dir($directory) ? $directory : null;
     }
 
     private function truncate(string $value, int $length): string

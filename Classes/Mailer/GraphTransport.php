@@ -93,12 +93,31 @@ final class GraphTransport extends AbstractTransport
         $status = $response->getStatusCode();
         if ($status !== 202) {
             $requestId = $response->getHeaderLine('request-id');
+            $body = (string)$response->getBody();
+
+            $hint = '';
+            if ($status === 401 && $body === '') {
+                $hint = ' — empty 401 body almost always means the access token carries no application roles. '
+                    . 'In Azure: App registrations → your app → API permissions → confirm "Mail.Send" is listed under '
+                    . 'Application permissions (NOT Delegated) and shows "Granted for <tenant>". '
+                    . 'Click "Grant admin consent" if the status is orange. Then invalidate the token cache '
+                    . '(e.g. typo3 cache:flush) before retrying.';
+            } elseif ($status === 403 && str_contains($body, 'Access is denied')) {
+                $hint = ' — 403 ErrorAccessDenied typically means an Application Access Policy in Exchange Online '
+                    . 'is blocking this mailbox. Run Get-ApplicationAccessPolicy in Exchange Online PowerShell and '
+                    . 'add the sender mailbox to the allowed group.';
+            } elseif ($status === 404 && str_contains($body, 'MailboxNotEnabledForRESTAPI')) {
+                $hint = ' — 404 MailboxNotEnabledForRESTAPI means the sender UPN has no Exchange Online license or '
+                    . 'is not a real mailbox. Verify the mailbox in Microsoft 365 admin center.';
+            }
+
             throw new GraphMailerException(sprintf(
-                'Microsoft Graph sendMail failed (HTTP %d, request-id=%s, sender=%s): %s',
+                'Microsoft Graph sendMail failed (HTTP %d, request-id=%s, sender=%s): %s%s',
                 $status,
                 $requestId !== '' ? $requestId : 'n/a',
                 $senderUpn,
-                (string)$response->getBody()
+                $body !== '' ? $body : '<empty body>',
+                $hint
             ));
         }
     }

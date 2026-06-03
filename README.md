@@ -110,12 +110,52 @@ typo3 oauth-service:monitor-connections    # daily
 ## Testing
 
 ```bash
-typo3 mailer:test-recipient you@example.com
+typo3 microsoft-graph-mailer:test you@example.com
 ```
 
 A successful send returns silently. On error the transport throws a
 `GraphMailerException` with the Microsoft `request-id` header — quote
 that in any Microsoft support case.
+
+## Failure handling — the spool fallback
+
+To avoid silently dropping emails when Microsoft Graph rejects a request
+(no OAuth client configured, expired secret, license issue, 401/403/404
+from `sendMail`, …), the transport writes the original message as an
+`.eml` file plus a `.json` failure record to a spool directory and lets
+the caller proceed. Default location:
+
+```
+<typo3_var>/log/microsoft-graph-mailer/undelivered/
+```
+
+Each undelivered message becomes a pair:
+
+- `YYYYMMDD-HHMMSS-recipient_at_domain-xxxxxxxx.eml` — full RFC 5322
+  message; openable in any mail client, ready for manual resend
+- `YYYYMMDD-HHMMSS-recipient_at_domain-xxxxxxxx.json` — failure metadata
+  (timestamp, error reason, recipients, subject)
+
+### Audit and recovery
+
+```bash
+typo3 microsoft-graph-mailer:list-undelivered
+```
+
+shows everything currently in the spool with the original failure reason.
+Inspect the `.eml` file with any RFC 5322-aware tool, manually fix the
+issue (e.g. add the missing Mailbox license in Microsoft 365), and once
+recovered delete the `.eml` / `.json` pair.
+
+### Configuration
+
+```php
+// Override the spool path:
+$GLOBALS['TYPO3_CONF_VARS']['MAIL']['transport_graph_fallback_directory'] = '/srv/mail-spool/graph';
+
+// Disable the fallback entirely (re-raises GraphMailerException, may break form-submits etc.):
+$GLOBALS['TYPO3_CONF_VARS']['MAIL']['transport_graph_fallback_directory'] = false;
+```
 
 ## Multiple senders
 

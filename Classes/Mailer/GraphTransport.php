@@ -8,6 +8,7 @@ use Symfony\Component\Mailer\SentMessage;
 use Symfony\Component\Mailer\Transport\AbstractTransport;
 use Symfony\Component\Mime\Email;
 use Symfony\Component\Mime\Message;
+use TYPO3\CMS\Core\Core\Environment;
 use TYPO3\CMS\Core\Http\RequestFactory;
 use TYPO3\CMS\Core\Log\LogManager;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
@@ -24,22 +25,27 @@ use WapplerSystems\OauthService\Service\TokenAcquisitionService;
  * Sender mailbox + tenant id are read from the active OAuth client's metadata
  * JSON (keys: tenant_id, sender_upn).
  *
- * Note on dependencies: TYPO3 TransportFactory loads custom transports via
- * GeneralUtility::makeInstance(FQCN, $mailSettings). makeInstance only
- * consults the DI container when no constructor arguments are passed
- * (see GeneralUtility.php), so we cannot use constructor autowiring here.
- * Services are looked up lazily inside doSend() via makeInstance, which
- * works because TokenAcquisitionService, OAuthClientService and
- * RequestFactory are all exposed as public container services.
+ * Failure handling: when Graph rejects the request (missing client, missing
+ * token, HTTP 4xx/5xx) the original Email is serialised to an .eml file in
+ * the fallback spool directory so the operator can recover and re-send it
+ * later. The default spool location is var/log/microsoft-graph-mailer/
+ * undelivered/. Override via $TYPO3_CONF_VARS['MAIL']['transport_graph_
+ * fallback_directory']; set to false to disable the fallback (in which case
+ * any failure re-raises GraphMailerException and propagates up).
+ *
+ * Use the typo3 microsoft-graph-mailer:list-undelivered command to audit the
+ * spool directory.
  */
 final class GraphTransport extends AbstractTransport
 {
     private const PROVIDER = 'microsoft_graph';
     private const SEND_MAIL_ENDPOINT = 'https://graph.microsoft.com/v1.0/users/%s/sendMail';
 
+    private readonly mixed $fallbackDirectorySetting;
+
     /**
-     * @param array<string, mixed> $mailSettings Reserved for future per-deployment
-     *     overrides (e.g. a different provider identifier). Not used yet.
+     * @param array<string, mixed> $mailSettings TYPO3 mail settings array passed by
+     *     TransportFactory. Reads transport_graph_fallback_directory.
      */
     public function __construct(array $mailSettings = [])
     {
@@ -47,6 +53,13 @@ final class GraphTransport extends AbstractTransport
             null,
             GeneralUtility::makeInstance(LogManager::class)->getLogger(self::class)
         );
+
+        // Read at construct time so we capture the value once. TYPO3 caches the
+        // transport instance for the request, so re-reading on every send would
+        // be wasted work.
+        $this->fallbackDirectorySetting = $mailSettings['transport_graph_fallback_directory']
+            ?? $GLOBALS['TYPO3_CONF_VARS']['MAIL']['transport_graph_fallback_directory']
+            ?? null;
     }
 
     public function __toString(): string
@@ -64,6 +77,29 @@ final class GraphTransport extends AbstractTransport
             ));
         }
 
+        try {
+            $this->trySendViaGraph($original);
+        } catch (GraphMailerException $e) {
+            $fallbackDir = $this->resolveFallbackDirectory();
+            if ($fallbackDir === null) {
+                throw $e;
+            }
+
+            $emlPath = $this->writeFallbackFile($original, $e, $fallbackDir);
+            $this->logger->warning(
+                'Microsoft Graph delivery failed; original message spooled to file for recovery',
+                [
+                    'reason' => $e->getMessage(),
+                    'eml_path' => $emlPath,
+                    'recipients' => array_map(static fn ($a) => $a->getAddress(), $original->getTo()),
+                    'subject' => (string)$original->getSubject(),
+                ]
+            );
+        }
+    }
+
+    private function trySendViaGraph(Email $original): void
+    {
         $oauthClient = GeneralUtility::makeInstance(OAuthClientService::class);
         $tokenAcquisition = GeneralUtility::makeInstance(TokenAcquisitionService::class);
         $requestFactory = GeneralUtility::makeInstance(RequestFactory::class);
@@ -139,5 +175,66 @@ final class GraphTransport extends AbstractTransport
                 $hint
             ));
         }
+    }
+
+    /**
+     * Returns the absolute fallback directory, ensuring it exists, or null when
+     * the operator has explicitly disabled the fallback by setting the config
+     * value to false.
+     */
+    private function resolveFallbackDirectory(): ?string
+    {
+        if ($this->fallbackDirectorySetting === false) {
+            return null;
+        }
+
+        $configured = is_string($this->fallbackDirectorySetting) && $this->fallbackDirectorySetting !== ''
+            ? $this->fallbackDirectorySetting
+            : Environment::getVarPath() . '/log/microsoft-graph-mailer/undelivered';
+
+        if (!is_dir($configured)) {
+            if (!@mkdir($configured, 0775, true) && !is_dir($configured)) {
+                $this->logger->error(
+                    'Microsoft Graph fallback directory cannot be created; original exception will be re-thrown',
+                    ['path' => $configured]
+                );
+                return null;
+            }
+        }
+
+        return rtrim($configured, '/');
+    }
+
+    private function writeFallbackFile(Email $email, GraphMailerException $reason, string $directory): string
+    {
+        $emlBody = $email->toString();
+        $recipientHint = '';
+        $firstTo = $email->getTo()[0] ?? null;
+        if ($firstTo !== null) {
+            $recipientHint = '-' . preg_replace('/[^a-zA-Z0-9._-]/', '_', $firstTo->getAddress());
+        }
+
+        $base = sprintf(
+            '%s%s-%s',
+            date('Ymd-His'),
+            $recipientHint,
+            substr(sha1($emlBody . microtime(true)), 0, 8)
+        );
+
+        $emlPath = $directory . '/' . $base . '.eml';
+        $jsonPath = $directory . '/' . $base . '.json';
+
+        file_put_contents($emlPath, $emlBody);
+        file_put_contents($jsonPath, (string)json_encode([
+            'failed_at' => date(\DATE_ATOM),
+            'reason' => $reason->getMessage(),
+            'subject' => (string)$email->getSubject(),
+            'from' => array_map(static fn ($a) => $a->toString(), $email->getFrom()),
+            'to' => array_map(static fn ($a) => $a->toString(), $email->getTo()),
+            'cc' => array_map(static fn ($a) => $a->toString(), $email->getCc()),
+            'bcc' => array_map(static fn ($a) => $a->toString(), $email->getBcc()),
+        ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+
+        return $emlPath;
     }
 }

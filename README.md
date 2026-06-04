@@ -169,11 +169,58 @@ in the BE form.
 
 ```php
 // Override the spool path:
-$GLOBALS['TYPO3_CONF_VARS']['MAIL']['transport_graph_fallback_directory'] = '/srv/mail-spool/graph';
+$GLOBALS['TYPO3_CONF_VARS']['MAIL']['transport_graph_fallback_directory'] = '/var/typo3-mail-spool/';
 
 // Disable the fallback entirely (re-raises GraphMailerException, may break form-submits etc.):
 $GLOBALS['TYPO3_CONF_VARS']['MAIL']['transport_graph_fallback_directory'] = false;
 ```
+
+## Sender address & `defaultMailFromAddress`
+
+The transport calls `/users/{sender_upn}/sendMail` — Graph treats that
+mailbox as the authenticated sender. The email's `From:` header is taken
+from the Symfony `Email::getFrom()` (typically TYPO3's
+`$GLOBALS['TYPO3_CONF_VARS']['MAIL']['defaultMailFromAddress']`) and
+placed into `message.from` of the Graph payload.
+
+When `defaultMailFromAddress` differs from `sender_upn`, Exchange Online
+requires the `sender_upn` mailbox to hold **Send As** (or *Send on
+Behalf*) permission for the `defaultMailFromAddress` mailbox. Without
+it, Graph rejects the request:
+
+```
+HTTP 403  ErrorSendAsDenied
+"The user account which was used to submit this request does not have the
+ right to send mail on behalf of the specified sending account."
+```
+
+Fix in Exchange Online PowerShell:
+
+```powershell
+Add-RecipientPermission -Identity "<defaultMailFromAddress>" `
+    -Trustee "<sender_upn>" `
+    -AccessRights SendAs -Confirm:$false
+```
+
+Or in the Microsoft 365 Admin Center: **Active users → \<defaultMail-
+FromAddress\> → Mail → Manage mailbox permissions → Send as →** add
+`<sender_upn>`.
+
+Notes:
+
+- `<defaultMailFromAddress>` must be a real mailbox or Shared Mailbox.
+  Pure aliases of `sender_upn` cannot carry their own permissions —
+  convert the alias into a Shared Mailbox, or align
+  `defaultMailFromAddress` with `sender_upn`.
+- *Send on Behalf* (`Set-Mailbox -GrantSendOnBehalfTo`) is a valid
+  alternative but adds a `Sender:` header, so recipients see
+  *"\<sender_upn\> on behalf of \<from\>"* in their mail client.
+  Usually not desired.
+- Permission changes propagate in Exchange Online within minutes (up
+  to one hour). Flush the TYPO3 token cache (`typo3 cache:flush`) before
+  retrying. Until the permission lands, failed sends accumulate in the
+  spool — re-flight them via
+  `typo3 microsoft-graph-mailer:resend-undelivered` once it works.
 
 ## Multiple senders
 

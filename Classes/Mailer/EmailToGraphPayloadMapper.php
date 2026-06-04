@@ -26,6 +26,11 @@ final class EmailToGraphPayloadMapper
             'toRecipients' => $this->mapAddresses($email->getTo()),
         ];
 
+        $from = $email->getFrom();
+        if ($from !== []) {
+            $message['from'] = $this->mapAddresses([$from[0]])[0];
+        }
+
         if ($email->getCc() !== []) {
             $message['ccRecipients'] = $this->mapAddresses($email->getCc());
         }

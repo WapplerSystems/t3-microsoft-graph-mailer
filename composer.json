@@ -27,7 +27,7 @@
     "require": {
         "php": ">=8.2",
         "typo3/cms-core": "^14",
-        "wapplersystems/oauth-service": "^14.1",
+        "wapplersystems/oauth-service": "^14.2",
         "symfony/mailer": "^7.0",
         "symfony/mime": "^7.0"
     },

@@ -170,7 +170,7 @@ final class GraphTransport extends AbstractTransport
             if ($rewritten === null) {
                 throw $primaryError;
             }
-            $this->log->info(
+            $this->log->warning(
                 'Microsoft Graph 403 ErrorSendAsDenied — retrying with sender_upn rewrite (original From moved to Reply-To)',
                 [
                     'original_from' => $graphPayload['message']['from']['emailAddress']['address'] ?? null,

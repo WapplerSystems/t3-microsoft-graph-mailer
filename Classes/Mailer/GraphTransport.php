@@ -162,7 +162,68 @@ final class GraphTransport extends AbstractTransport
             );
         }
 
-        self::postSendMail($requestFactory, $senderUpn, $token, $graphPayload);
+        try {
+            self::postSendMail($requestFactory, $senderUpn, $token, $graphPayload);
+            return;
+        } catch (GraphMailerException $primaryError) {
+            $rewritten = self::rewritePayloadForSendAsFallback($graphPayload, $senderUpn, $primaryError);
+            if ($rewritten === null) {
+                throw $primaryError;
+            }
+            $this->log->info(
+                'Microsoft Graph 403 ErrorSendAsDenied — retrying with sender_upn rewrite (original From moved to Reply-To)',
+                [
+                    'original_from' => $graphPayload['message']['from']['emailAddress']['address'] ?? null,
+                    'rewritten_from' => $senderUpn,
+                ]
+            );
+            self::postSendMail($requestFactory, $senderUpn, $token, $rewritten);
+        }
+    }
+
+    /**
+     * If $error is the Microsoft 365 "Send As denied" rejection AND the
+     * current payload has a From-address that differs from the OAuth identity
+     * ($senderUpn), return a payload variant whose From is rewritten to
+     * $senderUpn — the original From is moved into Reply-To so replies still
+     * reach the intended mailbox. Returns null when no useful retry is
+     * possible (different error, no From, or From already matches senderUpn).
+     *
+     * @param array<string, mixed> $payload
+     * @return array<string, mixed>|null
+     */
+    private static function rewritePayloadForSendAsFallback(
+        array $payload,
+        string $senderUpn,
+        GraphMailerException $error
+    ): ?array {
+        if (!str_contains($error->getMessage(), 'ErrorSendAsDenied')) {
+            return null;
+        }
+        $currentFrom = (string)($payload['message']['from']['emailAddress']['address'] ?? '');
+        if ($currentFrom === '' || strcasecmp($currentFrom, $senderUpn) === 0) {
+            return null;
+        }
+
+        $originalEntry = $payload['message']['from'];
+        $payload['message']['from']['emailAddress']['address'] = $senderUpn;
+        // Keep the display name (e.g. "PART Engineering") so recipients still
+        // see the friendly label, even though the underlying mailbox changed.
+
+        // Prepend original From to Reply-To list, deduping by address.
+        $existing = $payload['message']['replyTo'] ?? [];
+        $seen = [strtolower($currentFrom)];
+        $replyTo = [$originalEntry];
+        foreach ($existing as $entry) {
+            $addr = strtolower((string)($entry['emailAddress']['address'] ?? ''));
+            if ($addr !== '' && !in_array($addr, $seen, true)) {
+                $seen[] = $addr;
+                $replyTo[] = $entry;
+            }
+        }
+        $payload['message']['replyTo'] = $replyTo;
+
+        return $payload;
     }
 
     /**
